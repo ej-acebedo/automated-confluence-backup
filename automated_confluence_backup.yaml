@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  CFSITENAME:
+    Type: String
+    Description: Confluence site parameter in SSM
+  CFEMAIL:
+    Type: String
+    Description: Confluence email parameter in SSM
+  CFTOKEN:
+    Type: String
+    Description: Confluence API token parameter in SSM
+  CFBUCKETNAME:
+    Type: String
+    Description: S3 bucket to store scripts, lambda function zip files, backups
+Resources:
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: main
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"]
+                Resource: [!Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"]
+              - Effect: Allow
+                Action: ["ssm:GetParameter"]
+                Resource: [!Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:*"]
+
+  StepFunctionExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "states.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: main
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"]
+                Resource: [!Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"]
+              - Effect: Allow
+                Action: ["codebuild:StartBuild", "codebuild:BatchGetBuilds"]
+                Resource: [!Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:*"]
+              - Effect: Allow
+                Action: ["lambda:InvokeFunction"]
+                Resource: [!GetAtt StartBackup.Arn, !GetAtt GetBackupProgress.Arn]
+
+  CodeBuildExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "codebuild.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: main
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"]
+                Resource: [!Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"]
+              - Effect: Allow
+                Action: ["codebuild:CreateReportGroup","codebuild:CreateReport","codebuild:UpdateReport","codebuild:BatchPutTestCases","codebuild:BatchPutCodeCoverages"]
+                Resource: [!Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:*"]
+              - Effect: Allow
+                Action: ["ssm:GetParameter","ssm:GetParameters"]
+                Resource: [!Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:*"]
+              - Effect: Allow
+                Action: ["s3:PutObject","s3:GetObject"]
+                Resource: [!Sub "arn:aws:s3:::${CFBUCKETNAME}*"] 
+
+  StartBackup:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref CFBUCKETNAME
+        S3Key: lambda_functions/cf_startbackup.zip
+      Environment:
+        Variables:
+          CF_SITENAME: !Ref CFSITENAME
+          CF_EMAIL: !Ref CFEMAIL
+          CF_TOKEN: !Ref CFTOKEN
+  GetBackupProgress:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref CFBUCKETNAME
+        S3Key: lambda_functions/cf_getbackupprogress.zip
+      Environment:
+        Variables:
+          CF_SITENAME: !Ref CFSITENAME
+          CF_EMAIL: !Ref CFEMAIL
+          CF_TOKEN: !Ref CFTOKEN
+
+  AutomatedConfluenceBackup:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      DefinitionString:
+        !Sub |
+        {
+          "Comment": "Automated Confluunce backup",
+          "StartAt": "Start backup",
+          "States": {
+            "Start backup": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "Payload.$": "$",
+                "FunctionName": "${StartBackup.Arn}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 6,
+                  "BackoffRate": 2
+                }
+              ],
+              "Next": "GetBackupProgress"
+            },
+            "GetBackupProgress": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "OutputPath": "$.Payload",
+              "Parameters": {
+                "Payload.$": "$",
+                "FunctionName": "${GetBackupProgress.Arn}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 6,
+                  "BackoffRate": 2
+                }
+              ],
+              "Next": "IsBackupAvailable"
+            },
+            "IsBackupAvailable": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Not": {
+                        "Variable": "$.fileName",
+                        "IsPresent": true
+                      }
+                    },
+                    {
+                      "Variable": "$.alternativePercentage",
+                      "IsPresent": true
+                    }
+                  ],
+                  "Comment": "No",
+                  "Next": "WAIT_BACKUP"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.fileName",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.alternativePercentage",
+                      "StringMatches": "100%"
+                    }
+                  ],
+                  "Comment": "yes",
+                  "Next": "MoveBackupToS3"
+                }
+              ],
+              "Default": "BackupFail"
+            },
+            "MoveBackupToS3": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::codebuild:startBuild",
+              "Parameters": {
+                "ProjectName": "confluence-backup-to-s3"
+              },
+              "Next": "GetBuildStatus",
+              "ResultSelector": {
+                "build_id.$": "$.Build.Id"
+              }
+            },
+            "GetBuildStatus": {
+              "Type": "Task",
+              "Next": "IsDownloadDone",
+              "Parameters": {
+                "Ids.$": "States.Array($.build_id)"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:codebuild:batchGetBuilds",
+              "ResultPath": "$.out"
+            },
+            "IsDownloadDone": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.out.Builds[0].BuildStatus",
+                  "StringMatches": "IN_PROGRESS",
+                  "Comment": "no",
+                  "Next": "WAIT_DOWNLOAD"
+                },
+                {
+                  "Variable": "$.out.Builds[0].BuildStatus",
+                  "StringMatches": "SUCCEEDED",
+                  "Comment": "yes",
+                  "Next": "Success"
+                }
+              ],
+              "Default": "DownloadFail"
+            },
+            "DownloadFail": {
+              "Type": "Fail"
+            },
+            "Success": {
+              "Type": "Succeed"
+            },
+            "WAIT_DOWNLOAD": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "GetBuildStatus"
+            },
+            "BackupFail": {
+              "Type": "Fail"
+            },
+            "WAIT_BACKUP": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "GetBackupProgress"
+            }
+          }
+        }
+
+
+  DownloadToS3Build:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: confluence-backup-to-s3
+      ServiceRole: !GetAtt CodeBuildExecutionRole.Arn
+      ConcurrentBuildLimit: 1
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        EnvironmentVariables:
+          - Name: CF_SITENAME
+            Type: PARAMETER_STORE
+            Value: !Ref CFSITENAME
+          - Name: CF_EMAIL
+            Type: PARAMETER_STORE
+            Value: !Ref CFEMAIL
+          - Name: CF_TOKEN
+            Type: PARAMETER_STORE
+            Value: !Ref CFTOKEN
+          - Name: CF_BUCKET_NAME
+            Type: PLAINTEXT
+            Value: !Ref CFBUCKETNAME
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Downloading script from S3"
+                - aws s3 cp "s3://${CF_BUCKET_NAME}/scripts/download_backup.py" ./download_backup.py
+            build:
+              commands:
+                - echo "Start download"
+                - python ./download_backup.py
+            post_build:
+              commands:
+                - echo "Uploading backup to S3"
+                - aws s3 cp "${CF_SITENAME}_conf_backup.zip" "s3://${CF_BUCKET_NAME}/$(date +'%Y-%m-%d')_${CF_SITENAME}_conf_backup.zip"
+
+      TimeoutInMinutes: 60
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
